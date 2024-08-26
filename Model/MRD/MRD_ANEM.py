@@ -316,7 +316,7 @@ class VariationalTopicModel(nn.Module):
         
 
 class VanilaAttentionModelTopic(nn.Module):
-    def __init__(self, num_classes=3, pretrained_embed=None, embedding_size=100, 
+    def __init__(self, num_classes=3, pretrained_embed=pretrained_embed, embedding_size=100, 
                  hidden_size=64, dropout_keep_proba=0.1, max_word_num=500, batch_size=8):
         super(VanilaAttentionModelTopic, self).__init__()
         self.num_classes = int(num_classes)
