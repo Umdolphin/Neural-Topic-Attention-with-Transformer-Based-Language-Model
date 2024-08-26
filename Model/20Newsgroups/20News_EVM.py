@@ -1,0 +1,263 @@
+## Package load
+import pandas as pd
+import numpy as np
+import torch
+import time
+from torch.utils.data import Dataset, DataLoader
+from transformers import ElectraTokenizer, ElectraModel
+from tqdm import tqdm
+from torch import nn
+import torch.nn.functional as F
+import random
+import gc
+from transformers import AdamW
+from transformers.optimization import get_cosine_schedule_with_warmup
+from torchmetrics import F1Score,Precision,Recall
+import re
+
+# Set seed
+random_seed= 42
+torch.manual_seed(random_seed)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+np.random.seed(random_seed)
+
+# Make storage
+
+News_EVM = pd.DataFrame(columns = ['Num_Topic','AUC','Precision','Recall','F1','random_seed','Time'])
+
+## Data load
+
+train_df = pd.read_csv('train_df_20News.csv')
+train_df = train_df.drop(train_df.columns[0],axis=1)
+
+test_df = pd.read_csv('test_df_20News.csv')
+test_df = test_df.drop(test_df.columns[0],axis=1)
+
+
+train_data_label = train_df['Subject'].tolist()
+test_data_label = test_df['Subject'].tolist()
+
+    
+device = torch.device("cuda")
+
+tokenizer = ElectraTokenizer.from_pretrained('google/electra-base-discriminator')
+Electra = ElectraModel.from_pretrained("google/electra-base-discriminator")
+
+max_len = 256
+    
+class CustomDataset(Dataset):
+    def __init__(self, dataset, sent_idx, label_idx, Albert_tokenizer, max_len, pad, pair):
+        self.sentences = [
+            Albert_tokenizer(
+                text, padding='max_length', return_tensors="pt",
+                max_length=max_len, truncation='only_first'
+            ) for text in dataset['text']
+        ]
+        self.labels = [np.int32(label) for label in dataset['Subject']]
+
+    def get_batch_labels(self, i):
+        # Fetch a batch of labels
+        return np.array(self.labels[i])
+
+    def get_batch_texts(self, i):
+        # Fetch a batch of inputs
+        return self.sentences[i]
+
+    def __getitem__(self, i):
+        batch_texts = self.get_batch_texts(i)
+        batch_y = self.get_batch_labels(i)
+        return batch_texts, batch_y
+
+    def __len__(self):
+        return len(self.labels)
+    
+batch_size = 8
+    
+train_df['text'] = train_df['text'].apply(lambda x: re.sub('[^a-zA-Z0-9]',' ',x).strip())
+train_df['text'] = train_df['text'].apply(lambda x: ' '.join(x.split()))
+test_df['text'] = test_df['text'].apply(lambda x: re.sub('[^a-zA-Z0-9]',' ',x).strip())
+test_df['text'] = test_df['text'].apply(lambda x: ' '.join(x.split()))
+
+train_dataset = CustomDataset(train_df, 0,1, tokenizer, max_len, True, False)
+train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+test_dataset = CustomDataset(test_df, 0,1, tokenizer, max_len, True, False)
+test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    
+class ElectraClassifier(nn.Module):
+    def __init__(self,
+                 Electra,
+                 hidden_size=768,
+                 num_classes=20,
+                 dr_rate=None,
+                 params=None):
+        super(ElectraClassifier, self).__init__()
+
+        self.Electra = Electra
+        self.dr_rate = dr_rate
+        self.classifier = nn.Linear(hidden_size, num_classes)
+        
+        if dr_rate:
+            self.dropout = nn.Dropout(p=dr_rate)
+        #nn.init.xavier_uniform_(self.classifier.weight)
+
+    def forward(self, token_ids, segment_ids, attention_mask, length):
+        final_out = torch.empty(length, 768).to(device)
+
+        pooler = self.Electra(input_ids=token_ids, token_type_ids=segment_ids, attention_mask=attention_mask)[0]
+
+        for i in range(length):
+            final_out[i] = pooler[i][0]
+
+        if self.dr_rate:
+            out = self.dropout(final_out)
+        else:
+            out = final_out
+
+        return self.classifier(out)
+
+model = ElectraClassifier(Electra,dr_rate = 0.1).to(device)
+    
+learning_rate =  2e-5
+num_epochs = 5
+max_grad_norm = 1
+    
+# Adamw
+
+t_total = len(train_dataloader) * num_epochs
+
+loss_fn = nn.CrossEntropyLoss()
+
+warmup_ratio = 0.1
+no_decay = ['bias', 'LayerNorm.weight']
+optimizer_grouped_parameters = [
+    {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
+    {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+]
+
+optimizer = AdamW(optimizer_grouped_parameters, lr=learning_rate)
+warmup_step = int(t_total * warmup_ratio)
+scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_step, num_training_steps=t_total)
+
+
+def accuracy(X,Y):
+    max_vals, max_indices = torch.max(X, 1)
+    train_acc = (max_indices == Y).sum().data.cpu().numpy()/max_indices.size()[0]
+    return train_acc
+    
+start = time.time()
+
+
+train_acc_L = []
+test_acc_L = []
+train_ce_L = []
+test_ce_L = []
+
+train_f1_score = []
+test_f1_score = []
+train_precision_L = []
+test_precision_L = []
+train_recall_L = []
+test_recall_L = []
+    
+precision_score = Precision(num_classes = 20, average = 'macro').to(device)
+recall_score = Recall(num_classes = 20, average = 'macro').to(device)
+f1 = F1Score(num_classes = 20,average='macro').to(device)  
+    
+for e in range(num_epochs):
+    train_acc = 0.0
+    test_acc = 0.0
+    train_ce = 0.0
+    test_ce = 0.0
+    
+    train_f1 = 0
+    test_f1 = 0
+    train_precision = 0
+    test_precision = 0
+    train_recall = 0
+    test_recall = 0
+    
+    # Train
+    
+    model.train()
+    
+    for batch_id, (train_input, train_label) in enumerate(train_dataloader):
+        optimizer.zero_grad()
+        
+        token_ids = train_input['input_ids'].squeeze(1).to(device)
+        segment_ids = train_input['token_type_ids'].squeeze(1).to(device)
+        attention_mask = train_input['attention_mask'].squeeze(1).to(device)
+        label = (train_label - 1).long().to(device)
+        length = len(token_ids)
+        
+        output = model(token_ids, segment_ids, attention_mask, length)
+        loss = loss_fn(output, label)
+        
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        optimizer.step()
+        scheduler.step()
+        
+        train_acc += accuracy(output, label)
+        train_ce += loss.data.cpu().numpy()
+        train_precision += precision_score(output, label).cpu().numpy()
+        train_recall += recall_score(output, label).cpu().numpy()
+        train_f1 += f1(output, label).cpu().numpy()
+        
+        if (batch_id + 1) % len(train_dataloader) == 0:
+            print("epoch {} train loss {} train acc {} train precision {} train recall {} train f1 {}".format(
+                e + 1, train_ce / (batch_id + 1), 
+                train_acc / (batch_id + 1),
+                train_precision / (batch_id + 1),
+                train_recall / (batch_id + 1),
+                train_f1 / (batch_id + 1)
+            ))
+    
+    # Test
+    
+    model.eval()
+    
+    for batch_id, (test_input, test_label) in enumerate(test_dataloader):
+        token_ids = test_input['input_ids'].squeeze(1).to(device)
+        segment_ids = test_input['token_type_ids'].squeeze(1).to(device)
+        attention_mask = test_input['attention_mask'].squeeze(1).to(device)
+        label = (test_label - 1).long().to(device)
+        length = len(token_ids)
+        
+        output = model(token_ids, segment_ids, attention_mask, length)
+        loss = loss_fn(output, label)
+        
+        test_acc += accuracy(output, label)
+        test_ce += loss.data.cpu().numpy()
+        test_precision += precision_score(output, label).cpu().numpy()
+        test_recall += recall_score(output, label).cpu().numpy()
+        test_f1 += f1(output, label).cpu().numpy()
+        
+        if (batch_id + 1) % len(test_dataloader) == 0:
+            print("epoch {} test loss {} test acc {} test precision {} test recall {} test f1 {}".format(
+                e + 1, test_ce / (batch_id + 1),
+                test_acc / (batch_id + 1),
+                test_precision / (batch_id + 1),
+                test_recall / (batch_id + 1),
+                test_f1 / (batch_id + 1)
+            ))
+            
+            test_acc_L.append(test_acc / (batch_id + 1))
+            test_ce_L.append(test_ce / (batch_id + 1))
+            test_precision_L.append(test_precision / (batch_id + 1))
+            test_recall_L.append(test_recall / (batch_id + 1))
+            test_f1_score.append(test_f1 / (batch_id + 1))
+            
+end = time.time() - start
+print(end)
+print('Fianl ACC : {} Final precision {} Final Recall {} Final F1 : {}'.format(np.mean(test_acc_L),
+                                                                                   np.mean(test_precision_L),
+                                                                                   np.mean(test_recall_L),
+                                                                                   np.mean(test_f1_score)))
+News_EVM = News_EVM.append({'Num_Topic' : num_topic,
+                 'AUC' : np.mean(test_acc_L),
+                 'Precision' : np.mean(test_precision_L),
+                 'Recall' : np.mean(test_recall_L),
+                 'F1' : np.mean(test_f1_score),
+                 'random_seed' : random_seed,
+                 'Time' : end},ignore_index = True)
