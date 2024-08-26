@@ -288,6 +288,7 @@ class VariationalTopicModel(nn.Module):
 
         self.W_fc = nn.Linear(self.embedding_size, self.vocab_size)
         nn.init.xavier_uniform_(self.W_fc.weight)
+        self.dropout2 = nn.Dropout(self.dropout_keep_proba)
         self.topic_embed_fc = nn.Linear(self.embedding_size, self.num_topic)
         nn.init.xavier_uniform_(self.topic_embed_fc.weight)
 
