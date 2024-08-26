@@ -105,6 +105,11 @@ class CustomDataset(Dataset):
     
 batch_size = 8
 
+train_df['text'] = train_df['text'].apply(lambda x: re.sub('[^a-zA-Z0-9]',' ',x).strip())
+train_df['text'] = train_df['text'].apply(lambda x: ' '.join(x.split()))
+test_df['text'] = test_df['text'].apply(lambda x: re.sub('[^a-zA-Z0-9]',' ',x).strip())
+test_df['text'] = test_df['text'].apply(lambda x: ' '.join(x.split()))
+
 train_dataset = CustomDataset(train_df, 0,1, tokenizer, max_len, True, False)
 train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
 test_dataset = CustomDataset(test_df, 0,1, tokenizer, max_len, True, False)
